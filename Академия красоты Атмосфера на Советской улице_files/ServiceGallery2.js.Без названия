@@ -1,0 +1,150 @@
+define([ 'jquery', 'underscore', 'js2/InfinitySlider' ], function($, _, Sli) {
+	
+	function ServiceGallery(node, params){
+		var self = this;
+		var cache = {};
+
+		self.node = node = $(node);
+		if (!node.length) return;
+		
+		if (node.data('ServiceGallery')) return node.data('ServiceGallery');
+		node.data('ServiceGallery', this);
+		
+		params = params || {};
+
+		var $gallery = $('.gallery-container', node);
+		var $controls = $('.gallery-controls', node);
+		var images = $controls.find('ul > li > a').map(function(){
+			var data = $(this).data();
+			return { src: data.original, copyright: data.copyright };
+		});
+
+		if(images.length <= 1) $controls.hide();
+
+		var slider = new Sli($gallery, {
+			slidee: $gallery.find('> ul'),
+			horizontal: true,
+			mouseDragging: true,
+			touchDragging: true,
+			releaseSwing: true,
+			keyboardNav: !!params.hotkeys,
+			prev: $('.prev', $controls),
+			next: $('.next', $controls),
+			progress: $('.js-slider', node)[0] || false,
+			activeClass: 'active',
+			startAt: 0
+		});
+		
+		function resize(img, iratio){
+			if (!img) return;
+			iratio = +iratio;
+			if (!iratio) return;
+			var css = {
+				top: '0px',
+				left: '0px',
+				width: 'auto',
+				height: 'auto'
+			};
+			var width = node.width();
+			var height = node.height();
+			var wratio = width / height;
+			if (iratio < wratio) {
+				css.top = (height - width / iratio) / 2 + 'px';
+				css.width = width + 'px';
+			} else {
+				css.left = (width - height * iratio) / 2 + 'px';
+				css.height = height + 'px';
+			}
+			img.style.top = css.top;
+			img.style.left = css.left;
+			img.style.width = css.width;
+			img.style.height = css.height;
+		}
+		function preload(src){
+			var img = cache[src];
+			if (!img) {
+				img = new Image;
+				img.src = src;
+				cache[src] = img;
+			}
+			return img;
+		}
+		
+		// Загрузка фотки, когда слайд попал во вьюпорт
+		slider.on('visiblein', function(el){
+			var $el = $(el);
+			var img = preload($el.data('original')).cloneNode(false);
+			resize(img, $el.data('ratio'));
+			$el.find('> img').eq(0).replaceWith(img).length || $el.append(img);
+			$el.data('img', img);
+		});
+		
+		// Предзагрузка соседних фоток, после первой активности юзера
+		slider.on('movestart', function f(source){
+			if (source === 'move') return;
+			slider.off('movestart', f);
+			function _preload(idx){
+				var item = slider.getByIndex(idx);
+				preload(item.$el.data('original'), item.$el.data('ratio'));
+			}
+			slider.on('active', function(el, item, idx){
+				for (var i = -1; i <= 2; ++i) {
+					if (i === 0) continue;
+					_.defer(_preload, idx + i);
+				}
+			});
+		});
+		
+		function onresize(){
+			slider.reload(true);
+			_.each(slider.rendered, function(item){
+				resize(item.$el.data('img'), item.$el.data('ratio'));
+			});
+		}
+		var onresized = _.debounce(onresize, 100);
+		$(window).on('resize', onresized);
+		//Надо делать триггер, если размер блоки меняется программно
+		node.on('z-resize', onresized);
+
+		slider.init();
+
+		// PhotoViewer Layer
+		function createPhotoViewLayer() {
+			create_layer('photoview', {
+				offset: 0,
+				images: images,
+				current: slider.getActiveIndex(),
+				beforeShow: function(){
+					$controls.hide();
+					$(window).trigger('track-event', [ 'service', 'photo' ]);
+				},
+				beforeClose: function(){
+					if (slider.orig.length > 1) {
+						$controls.show();
+					}
+				}
+			});
+		}
+
+		function openPhotoViewLayer(e){
+			if (e && $(e.target).closest('.copyright').length) return;
+			e.preventDefault();
+			createPhotoViewLayer();
+		}
+
+		$('.gallery-show-layer', node).on('click', 'li', openPhotoViewLayer);
+		$('.gallery-zoom-container, .gallery-layer-container', node).on('click', openPhotoViewLayer);
+		
+		slider.one('active', function(){
+			$(window).trigger('track-event', [ 'service', 'photo' ]);
+		});
+		
+		self.update = function(){};
+		self.setImage = function(idx){
+			slider.activate(idx);
+		};
+		self.openLayer = createPhotoViewLayer;
+	}
+
+	return ServiceGallery;
+});

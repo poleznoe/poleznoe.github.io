@@ -1,0 +1,823 @@
+/**
+ * Based on Sly (https://github.com/darsain/sly)
+ */
+define([ 'jquery', 'underscore', 'js2/Observable' ], function($, _, Observable){
+	"use strict";
+	
+	var DEBUG = false;
+	
+	var win = window;
+	var doc = win.document;
+	var $doc = $(doc);
+
+	var ns = 'InfinitySlider';
+
+	var prefixes = [ '', 'Webkit', 'Moz', 'ms', 'O' ];
+	var testEl = doc.createElement('div');
+
+	var rAF = window.requestAnimationFrame;
+	var cAF = window.cancelAnimationFrame;
+
+	var transform = _prop('transform');
+	var translateZ = _prop('perspective') ? 'translateZ(0) ' : '';
+	var willChange = _prop('will-change');
+	
+	var dragInitEvents = 'touchstart.' + ns + ' mousedown.' + ns;
+	var dragMouseEvents = 'mousemove.' + ns + ' mouseup.' + ns;
+	var dragTouchEvents = 'touchmove.' + ns + ' touchend.' + ns;
+	var keyboardInitEvents = 'keydown.' + ns;
+	var keyboardEndEvents = 'keyup.' + ns;
+	var clickEvent = 'click.' + ns;
+	var interactiveElements = [ 'input', 'select', 'button', 'textarea' ];
+	
+	var slice = Array.prototype.slice;
+	
+	var min = Math.min;
+	var max = Math.max;
+	var abs = Math.abs;
+	var floor = Math.floor;
+	var round = Math.round;
+	var ceil = Math.ceil;
+	var sqrt = Math.sqrt;
+	var pow = Math.pow;
+	
+	function InfinitySlider (frame, options) {
+		var self = this;
+		if (!(this instanceof InfinitySlider)) return new InfinitySlider(frame, options);
+		
+		var opt = _.extend({}, InfinitySlider.defaults, options);
+		_.extend(self, new Observable);
+		
+		var $frame = $(frame);
+		self.frame = frame = $frame.get(0);
+
+		var $dragSource = opt.dragSource ? $(opt.dragSource) : $frame;
+		var $slidee = opt.slidee ? $(opt.slidee).eq(0) : $frame.children().eq(0);
+		var slidee = self.slidee = $slidee.get(0);
+		var $prevButton = $(opt.prev);
+		var $nextButton = $(opt.next);
+		
+		var $progress = opt.progress ? $(opt.progress) : null;
+		var $prbar = $progress ? (opt.progressBar ? $(opt.progressBar) : $progress.children().eq(0) ) : null;
+		var $prbar2 = null;
+		var progressSize = null;
+		var pSync = 0;// Progress sync with 30 fps
+		
+		var active = null;
+		var activeIdx = null;
+		var offset = 0;
+		var frameSize = 0;
+		var slideeSize = 0;
+		var pos = self.pos = { start: 0, end: 0, cur: 0, dest: 0 };
+		var bar = { start: 0, end: 100, cur: 0, dest: 0, size: 0 };
+
+		var orig = self.orig = [];
+		var rendered = self.rendered = [];
+
+		var animation = {};
+		var dragging = self.dragging = { released: true };
+		var keyboard = self.keyboard = {};
+		var moveID = null;
+		var historyID = null;
+		var prevt = null;
+		var nextt = null;
+
+		self.initialized = false;
+		self.options = opt;
+
+		function init(){
+			if (self.initialized) return self;
+			if (InfinitySlider.getInstance(frame)) throw new Error('There is already a ' + ns + ' instance on this element');
+			InfinitySlider.storeInstance(frame, self);
+
+			$frame.css('overflow', 'hidden');
+			if (!transform && $frame.css('position') === 'static') {
+				$frame.css('position', 'relative');
+			}
+			
+			if (willChange) {
+				$slidee.css(willChange, transform || (horizontal ? 'left' : 'top'));
+			}
+			if (transform) {
+				if (translateZ) {
+					$slidee.css(transform, translateZ);
+				}
+			} else {
+				$slidee.css('position', 'absolute');
+			}
+
+			$dragSource.on(dragInitEvents, { source: 'slidee' }, dragInit);
+			$doc.on(keyboardInitEvents, keyboardHandler);
+			if (opt.prev) $prevButton.on(clickEvent, buttonsHandler);
+			if (opt.next) $nextButton.on(clickEvent, buttonsHandler);
+
+			self.initialized = true;
+			load(true);
+			return self;
+		}
+		function destroy(){
+			InfinitySlider.removeInstance(frame);
+
+			$doc.off(keyboardInitEvents, keyboardHandler);
+			$doc.off(keyboardEndEvents, keyboardEnd);
+			$frame
+				.add($prevButton)
+				.add($nextButton)
+				.off('.' + ns)
+			;
+			$.removeData(frame, ns);
+			
+			$prevButton
+				.add($nextButton)
+				.removeClass(opt.disabledClass)
+			;
+
+			orig.length = 0;
+			rendered.length = 0;
+			self.initialized = 0;
+			return self;
+		}
+
+		function load(isInit){
+			DEBUG && console.time('load');
+			frameSize = opt.horizontal ? _width($frame[0]) : _height($frame[0]);
+			slideeSize = 0;
+			
+			var current = isInit ? $slidee.children(opt.itemSelector) : slice.call(orig);
+			orig.length = 0;
+			rendered.length = 0;
+			_.each(current, function(el){
+				var item, clone;
+				if (_.isElement(el)) {
+					item = {};
+				} else {
+					item = el;
+					el = item.el;
+				}
+				var $el = $(el);
+				item.el = el;
+				item.$el = $el;
+				item.size = frameSize;
+				item.start = slideeSize;
+				item.center = item.start + item.size / 2;
+				item.end = item.start + item.size;
+				item.visible = false;
+				item.index = orig.length;
+				orig.push(item);
+
+				clone = _.clone(item);
+				clone.orig = item;
+				clone.$el.data(ns + '.item', clone);
+				rendered.push(clone);
+
+				slideeSize = item.end;
+			});
+			rendered.left = 0;
+			rendered.right = slideeSize;
+			pos.start = 0;
+			pos.end = max(0, slideeSize - frameSize);
+			$slidee[opt.horizontal ? 'width' : 'height'](slideeSize);
+			initProgress();
+			DEBUG && console.timeEnd('load');
+
+			if (isInit && opt.startAt != null) {
+				slideTo(opt.startAt * frameSize, true);
+				return;
+			}
+			cut();
+			reload();
+			visible();
+		}
+		function reload(checkFrame){
+			var i, len, item;
+			checkFrame = checkFrame || false;
+			
+			DEBUG && console.time('reload.' + +checkFrame);
+
+			if (checkFrame) {
+				var old = frameSize;
+				frameSize = opt.horizontal ? _width($frame[0]) : _height($frame[0]);
+				if ($progress) {
+					progressSize = _width($progress[0]);
+				}
+				if (old !== frameSize) {
+					slideeSize = 0;
+					var prev;
+					for (i = 0, len = orig.length; i < len; ++i) {
+					//i = -1; len = orig.length; while (++i < len) {
+						item = orig[i];
+						prev = orig[i - 1];
+						item.size = frameSize;
+						item.start = prev ? prev.end : 0;
+						item.center = item.start + item.size / 2;
+						item.end = item.start + item.size;
+						slideeSize = item.end;
+					}
+				}
+			}
+			
+			rendered.length = 0;
+			rendered.right = rendered.left = rendered.left || 0;
+			var $slides = $slidee.children(opt.itemSelector);
+			var el, $el;
+			for (i = 0, len = $slides.length; i < len; ++i) {
+			//i = -1; len = $slides.length; while (++i < len) {
+				$el = $slides.eq(i);
+				el = $el[0];
+				item = $el.data(ns + '.item');
+				item.el = el;
+				item.$el = $el;
+				item.size = item.orig.size;
+				item.start = rendered.right;
+				item.center = item.start + item.size / 2;
+				item.end = item.start + item.size;
+				el.style.display = 'block';
+				el.style.width = item.size + 'px';
+				rendered.right += item.size;
+				rendered.push(item);
+			}
+			
+			$slidee[opt.horizontal ? 'width' : 'height'](rendered.right - rendered.left);
+			
+			DEBUG && console.timeEnd('reload.' + +checkFrame);
+		}
+		
+		// Control
+		function slideTo(newPos, immediate){
+			if (dragging.released) {
+				newPos = getRelativePosition(newPos, true);
+			}
+			
+			animation.start = +new Date;
+			animation.time = 0;
+			animation.from = pos.cur;
+			animation.to = orig.length < 2 ? animation.from : newPos;
+			animation.delta = animation.to - animation.from;
+			animation.tweesing = dragging.tweese;
+			animation.immediate = !animation.tweesing && (immediate || dragging.active || !opt.speed);
+			
+			dragging.tweese = false;
+
+			pos.dest = animation.to;
+			moveID || move();
+		}
+		function prev(){
+			slideTo(getRelativePosition(pos.cur, true) - orig[ relIdx(offset - 1) ].size);
+		}
+		function next(){
+			slideTo(getRelativePosition(pos.cur, true) + orig[ relIdx(offset) ].size);
+		}
+		function activate(idx, direction){
+			var cur = relPos(pos.cur + orig[ relIdx(offset) ].start);
+			var target = orig[ relIdx(idx) ].start;
+			var toLeft = target - cur;
+			var toRight = target - cur;
+			
+			if (toLeft > 0) toLeft -= slideeSize;
+			if (toRight < 0) toRight += slideeSize;
+			
+			// If direction is not defined, then finding shortest way
+			direction = direction == null
+				? (abs(toLeft) < toRight ? toLeft : toRight)
+				: (direction < 0 ? toLeft : toRight)
+			;
+			
+			slideTo(direction);
+		}
+		
+		// Progress
+		function initProgress(){
+			if (!$progress) return;
+			if (orig.length < 2) {
+				_css($progress[0], { display: 'none' });
+				return;
+			}
+			bar.size = max(5, 100 / orig.length);
+			_css($prbar[0], { width: bar.size + '%' });
+			_css($progress[0], { overflow: 'hidden', display: 'block' });
+			progressSize = _width($progress[0]);
+			bar.end = 100 - bar.size;
+		}
+		function syncProgress(skip){
+			if (!$progress) return;
+			if (skip !== false && _is_odd(pSync++)) return;
+			
+			var scale = (bar.end - bar.start) / 100 * progressSize;
+			var handler = bar.size / 100 * progressSize;
+			var off = orig[ relIdx(offset) ].start;
+
+			bar.cur = (dragging.active ? relPos(pos.dest + off) : relPos(pos.cur + off)) / pos.end;
+			
+			if (bar.cur > 1) {
+				if (!$prbar2) {
+					$prbar2 = $($prbar[0].cloneNode(true));
+					_css($prbar2[0], { position: 'absolute', left: '0px', top: '0px' });
+					$progress[0].appendChild($prbar2[0]);
+				}
+				var mod = handler * (bar.cur - 1) * (orig.length - 1);
+				
+				_tick($prbar[0], scale + mod, true);
+				_tick($prbar2[0], -handler + mod, true);
+			} else {
+				if ($prbar2) {
+					_remove($progress[0], $prbar2[0]);
+					$prbar2 = null;
+				}
+				
+				_tick($prbar[0], scale * bar.cur, true);
+			}
+		}
+		
+		// Stat
+		function relPos(pos){
+			return (pos % slideeSize + slideeSize) % slideeSize;
+		}
+		function relIdx(idx){
+			var len = orig.length;
+			return (idx % len + len) % len;
+		}
+		function getRelativePosition(position, abs){
+			position += frameSize / 2;
+			var target = relPos(position);
+			var result = 0;
+			for (var i = 0, len = orig.length; i < len; ++i) {
+			//var i = -1, len = orig.length; while (++i < len) {
+				var item = orig[ relIdx(offset + i) ];
+				if (result + item.size <= target) {
+					result += item.size;
+					continue;
+				}
+				break;
+			}
+			return result + (abs ? floor(position / slideeSize) * slideeSize : 0);
+		}
+
+		// Check
+		function visible(){
+			//DEBUG && console.time('visible');//Usually fast
+			
+			var start = pos.cur;
+			var center = start + frameSize / 2;
+			var end = start + frameSize;
+			var result = 0;
+			var newActive;
+			for (var i = 0, len = rendered.length; i < len; ++i) {
+			//var i = -1, len = rendered.length; while (++i < len) {
+				var item = rendered[i];
+				result += item.size;
+
+				if (item.end > start && item.start < end) {
+					if (!item.visible){
+						item.visible = true;
+						self.trigger('visiblein', item.el, item.orig, getIndex(item));
+					}
+
+					if (!newActive) {
+						if (result > center) {
+							newActive = item;
+						}
+					}
+				} else {
+					if (item.visible){
+						item.visible = false;
+						self.trigger('visibleout', item.el, item.orig, getIndex(item));
+					}
+				}
+			}
+
+			if (active !== newActive) {
+				if (active) {
+					active.$el.removeClass(opt.activeClass);
+					active = null;
+				}
+				if (newActive) {
+					active = newActive;
+					activeIdx = getIndex(active);
+					active.$el.addClass(opt.activeClass);
+					self.trigger('active', active.el, active.orig, activeIdx);
+				}
+			}
+			
+			//DEBUG && console.timeEnd('visible');
+		}
+		function getIndex(item){
+			return (item.orig || item).index;
+		}
+		function getByIndex(index){
+			return orig[ relIdx(index) ];
+		}
+		function getActive(){
+			return active == null ? null : active;
+		}
+		function getActiveIndex(){
+			return activeIdx == null ? null : activeIdx;
+		}
+		
+		// DOM Modification
+		function cut(){
+			DEBUG && console.time('cut');
+			var i, len, item;
+
+			var left = pos.cur;
+			var right = left + frameSize;
+			
+			for (i = 0, len = rendered.length; i < len; ++i) {
+			//i = -1; len = rendered.length; while (++i < len) {
+				item = rendered[i];
+
+				if (item.end <= left) {
+					if (_remove(slidee, item.el)) {
+						self.trigger('domremove', item.el, item.orig, getIndex(item));
+					}
+				}
+
+				if (item.start >= right) {
+					if (_remove(slidee, item.el)) {
+						self.trigger('domremove', item.el, item.orig, getIndex(item));
+					}
+				}
+			}
+			
+			var start = relPos(orig[offset].start + left);
+			for (i = orig.length; i--;) {
+			//i = orig.length; while (i--) {
+				item = orig[i];
+				if (item.start <= start) {
+					offset = i;
+					break;
+				}
+			}
+			
+			offset = relIdx(offset);
+			rendered.left = 0;
+			slidee.style.marginLeft = rendered.left + 'px';
+			pos.cur = pos.dest = 0;
+			_tick(slidee, -pos.dest, opt.horizontal);
+			
+			DEBUG && console.timeEnd('cut');
+			return true;
+		}
+		function clone(from, to){
+			//DEBUG && console.time('clone');//Usually fast
+			var dh = doc.createDocumentFragment();
+			for (var i = from; i < to; ++i) {
+			//var i = from - 1; while (++i < to) {
+				var key = relIdx(i);
+				var item = orig[key];
+				//var $clone = item.$el.clone(false, false);
+				var $clone = $(item.$el[0].cloneNode(true));
+				$clone.data(ns + '.item', _.extend({}, item, { orig: item }));
+				self.trigger('dominsert', $clone[0], item, getIndex(item));
+				dh.appendChild($clone[0]);
+			}
+			//DEBUG && console.timeEnd('clone');
+			return dh;
+		}
+		function render(){
+			if (pos.cur >= rendered.left && pos.cur + frameSize <= rendered.right) return;
+			(pos.cur < rendered.left ? renderLeft() : renderRight()) && reload();
+		}
+		function renderLeft(){
+			var from = floor(pos.cur / frameSize);
+			var to = round(rendered.left / frameSize);
+			if (from < to) {
+				rendered.left = from * frameSize;
+				slidee.style.marginLeft = rendered.left + 'px';
+				slidee.insertBefore(clone(offset + from, offset + to), slidee.firstChild);
+				return true;
+			}
+			return false;
+		}
+		function renderRight(){
+			var from = round(rendered.right / frameSize);
+			var to = ceil(pos.cur / frameSize) + 1;
+			if (from < to) {
+				slidee.appendChild(clone(offset + from, offset + to));
+				return true;
+			}
+			return false;
+		}
+		
+		// Animation
+		function move(){
+			if (!self.initialized) return;
+
+			if (!moveID) {
+				if (dragging.released) {
+					self.trigger('movestart', 'move');
+				}
+				if (!animation.immediate) {
+					moveID = rAF(move);
+					return;
+				}
+			}
+
+			if (!dragging.released) {
+				draggingHistoryTick();
+			}
+			
+			if (animation.immediate) {
+				pos.cur = animation.to;
+			} else if (animation.tweesing) {
+				animation.tweeseDelta = animation.to - pos.cur;
+				if (abs(animation.tweeseDelta) < 1) {
+					pos.cur = animation.to;
+				} else {
+					pos.cur += animation.tweeseDelta * (dragging.released ? opt.swingSpeed : opt.syncSpeed);
+				}
+			} else {
+				animation.time = min(+new Date - animation.start, opt.speed);
+				pos.cur = animation.from + animation.delta * $.easing[opt.easing](animation.time / opt.speed, animation.time, 0, 1, opt.speed);
+			}
+
+			if (animation.to === pos.cur) {
+				pos.cur = animation.to;
+				dragging.tweese = false;
+				moveID = 0;
+			} else {
+				moveID = rAF(move);
+			}
+
+			_tick(slidee, -pos.cur, opt.horizontal);
+			self.trigger('move');
+			render();
+			visible();
+			syncProgress();
+
+			if (!moveID && dragging.released) {
+				self.trigger('moveend', 'move');
+				self.trigger('change');
+				if (!keyboard.init) {
+					cut() && reload();
+					syncProgress(false);
+				}
+			}
+		}
+		
+		// Button navigation
+		function buttonsHandler(e) {
+			e.preventDefault();
+			switch (this) {
+				case $prevButton[0]: self.trigger('movestart', 'button'); prev(); break;
+				case $nextButton[0]: self.trigger('movestart', 'button'); next(); break;
+			}
+		}
+
+		// Drag navigation
+		function dragInit(e){
+			var isTouch = e.type === 'touchstart';
+			var source = e.data.source;
+
+			if (dragging.init || !isTouch && isInteractive(e.target)) return;
+			if (!(isTouch ? opt.touchDragging : opt.mouseDragging && e.which < 2)) return;
+			if (!isTouch) e.preventDefault();
+
+			dragging.released = false;
+			dragging.source = source;
+			dragging.init = true;
+			dragging.active = false;
+			dragging.$source = $(e.target);
+			dragging.touch = isTouch;
+			dragging.pointer = isTouch ? e.originalEvent.touches[0] : e;
+			dragging.initX = dragging.pointer.pageX;
+			dragging.initY = dragging.pointer.pageY;
+			dragging.initPos = pos.cur;
+			dragging.start = +new Date;
+			dragging.time = 0;
+			dragging.path = 0;
+			dragging.delta = 0;
+			dragging.locked = 0;
+			dragging.history = [ 0, 0, 0, 0 ];
+			dragging.pathToLock = isTouch ? 30 : 10;
+
+			$doc.on(isTouch ? dragTouchEvents : dragMouseEvents, dragHandler);
+
+			dragHandler(e);
+			//historyID = setInterval(draggingHistoryTick, 1000 / 60);
+		}
+		function dragHandler(e){
+			if (0 !== e.type.indexOf(dragging.touch ? 'touch' : 'mouse')) return;
+			
+			dragging.released = e.type === 'mouseup' || e.type === 'touchend';
+			dragging.pointer = dragging.touch ? e.originalEvent[dragging.released ? 'changedTouches' : 'touches'][0] : e;
+			dragging.pathX = dragging.pointer.pageX - dragging.initX;
+			dragging.pathY = dragging.pointer.pageY - dragging.initY;
+			dragging.path = sqrt(pow(dragging.pathX, 2) + pow(dragging.pathY, 2));
+			dragging.delta = opt.horizontal ? dragging.pathX : dragging.pathY;
+
+			if (!dragging.released && dragging.path < 1) return;
+			if (!dragging.active) {
+				if (dragging.path < opt.dragThreshold) {
+					if (dragging.released) {
+						dragEnd();
+					}
+					return;
+				} else {
+					if (opt.horizontal ? abs(dragging.pathX) > abs(dragging.pathY) : abs(dragging.pathX) < abs(dragging.pathY)) {
+						$slidee.addClass(opt.draggedClass);
+						self.trigger('movestart', 'drag');
+						dragging.active = true;
+					} else {
+						dragEnd();
+						return;
+					}
+				}
+			}
+
+			e.preventDefault();
+			if (!dragging.locked && dragging.path > dragging.pathToLock) {
+				dragging.locked = true;
+				dragging.$source.on(clickEvent, _disableOneEvent);
+			}
+
+			if (dragging.released) {
+				dragEnd();
+				if (opt.releaseSwing) {
+					dragging.swing = (dragging.delta - dragging.history[0]) / 40 * 100;
+					dragging.delta += dragging.swing;
+					dragging.tweese = abs(dragging.swing) > 10;
+				}
+			}
+
+			slideTo(dragging.initPos - dragging.delta);
+		}
+		function dragEnd(){
+			//clearInterval(historyID);
+			dragging.released = true;
+			$doc.off(dragging.touch ? dragTouchEvents : dragMouseEvents, dragHandler);
+
+			_.defer(function(){
+				dragging.$source.off(clickEvent, _disableOneEvent);
+			});
+
+			if (pos.cur === pos.dest && dragging.active) {
+				$slidee.removeClass(opt.draggedClass);
+				self.trigger('moveend', 'drag');
+			}
+
+			dragging.init = false;
+			dragging.active = false;
+		}
+		function draggingHistoryTick(){
+			if (dragging.history == null) return;
+			dragging.history[0] = dragging.history[1];
+			dragging.history[1] = dragging.history[2];
+			dragging.history[2] = dragging.history[3];
+			dragging.history[3] = dragging.delta;
+		}
+
+		// Keyboard navigation
+		function keyboardInit(){
+			$doc.on(keyboardEndEvents, keyboardEnd);
+			prevt = _.throttle(prev, opt.speed + (opt.keyboardRepeatDelay||0), { leading: true, trailing: false });
+			nextt = _.throttle(next, opt.speed + (opt.keyboardRepeatDelay||0), { leading: true, trailing: false });
+			keyboard.init = true;
+			self.trigger('movestart', 'keyboard');
+		}
+		function keyboardHandler(e){
+			if (!opt.keyboardNav) return;
+			if (isInteractive(e.target)) return;
+			if (e.ctrlKey || e.altKey || e.shiftKey || e.metaKey) return;//metaKey is ⌘ in osx, and ⊞ on win
+			switch (e.which) {
+				case opt.horizontal ? 37 : 38:// Left or Up
+					if (!keyboard.init) keyboardInit();
+					prevt();
+					break;
+				case opt.horizontal ? 39 : 40:// Right or Down
+					if (!keyboard.init) keyboardInit();
+					nextt();
+					break;
+				default: return;
+			}
+			e.preventDefault();
+		}
+		function keyboardEnd(){
+			$doc.off(keyboardEndEvents, keyboardEnd);
+			prevt = nextt = null;
+			if (pos.cur === pos.dest && keyboard.init) {
+				if (!moveID) {
+					cut() && reload();
+				}
+				self.trigger('moveend', 'keyboard');
+			}
+			keyboard.init = false;
+		}
+
+		// Helpers
+		function isInteractive(el){
+			return -1 !== _.indexOf(interactiveElements, el.nodeName.toLowerCase()) || $(el).is(opt.interactive);
+		}
+		function extEvent(e, cb){
+			return function(){
+				self.trigger(e, 'external');
+				cb.apply(this, slice.call(arguments));
+			};
+		}
+
+		self.init = init;
+		self.destroy = destroy;
+		self.load = load;
+		self.reload = reload;
+		
+		self.getIndex = getIndex;
+		self.getByIndex = getByIndex;
+		self.getActive = getActive;
+		self.getActiveIndex = getActiveIndex;
+		
+		self.activate = extEvent('movestart', activate);
+		self.prev = extEvent('movestart', prev);
+		self.next = extEvent('movestart', next);
+		//self.slideTo = slideTo;
+	}
+	InfinitySlider.getInstance = function getInstance(el){
+		return $(el).data(ns);
+	};
+	InfinitySlider.storeInstance = function storeInstance(el, inst){
+		return $(el).data(ns, inst);
+	};
+	InfinitySlider.removeInstance = function removeInstance(el){
+		return $(el).removeData(ns);
+	};
+
+	function _disableOneEvent(e){
+		e.preventDefault();
+		e.stopPropagation();
+		$(this).off(e.type, _disableOneEvent);
+	}
+	function _prop(prop){
+		for (var i = 0, len = prefixes.length; i < len; ++i) {
+			var prefixedProp = prefixes[i] ? prefixes[i] + prop.charAt(0).toUpperCase() + prop.slice(1) : prop;
+			if (testEl.style[prefixedProp] != null) {
+				return prefixedProp;
+			}
+		}
+	}
+	function _width(el){
+		var bounds = el.getBoundingClientRect();
+		return bounds.width || bounds.right - bounds.left;
+	}
+	function _height(el){
+		var bounds = el.getBoundingClientRect();
+		return bounds.height || bounds.bottom - bounds.top;
+	}
+	function _css(el, css){
+		var style = el.style;
+		for (var i in css) {
+			//noinspection JSUnfilteredForInLoop
+			style[i] = css[i];
+		}
+	}
+	function _remove(parent, node){
+		if (node.parentNode === parent) {
+			parent.removeChild(node);
+			return true;
+		}
+		return false;
+	}
+	function _is_odd(v){ return 1 === (v % 2); }
+	function _tick(el, position, horizontal){
+		if (transform) {
+			el.style[transform] = translateZ + (horizontal ? 'translateX' : 'translateY') + '(' + (position) + 'px)';
+		} else {
+			el.style[horizontal ? 'left' : 'top'] = position + 'px';
+		}
+	}
+	
+	InfinitySlider.defaults = {
+		// Common options
+		slidee: null,// Selector, DOM element, or jQuery object with DOM element representing SLIDEE.
+		horizontal: false,// Switch to horizontal mode.
+
+		// Item
+		itemSelector: null,// Select only items that match this selector.
+
+		// Dragging
+		dragSource: null,// Selector or DOM element for catching dragging events. Default is FRAME.
+		mouseDragging: false,// Enable navigation by dragging the SLIDEE with mouse cursor.
+		touchDragging: false,// Enable navigation by dragging the SLIDEE with touch events.
+		releaseSwing: false,// Ease out on dragging swing release.
+		swingSpeed: 0.2,// Swing synchronization speed, where: 1 = instant, 0 = infinite.
+		dragThreshold: 3,// Distance in pixels before InfinitySlider recognizes dragging.
+		interactive: null,// Selector for special interactive elements.
+		syncSpeed: 0.5,// Handle => SLIDEE synchronization speed, where: 1 = instant, 0 = infinite.
+
+		// Animation
+		speed: 300,// Animations speed in milliseconds. 0 to disable animations.
+		easing: 'swing',// Easing for duration based (tweening) animations.
+		startAt: 0,// Starting offset in pixels or items.
+
+		// Classes
+		draggedClass: 'dragged',// Class for dragged elements (like SLIDEE or scrollbar handle).
+		activeClass: 'active',// Class for active items and pages.
+		disabledClass: 'disabled',// Class for disabled navigation elements.
+		
+		// Navigation
+		prev: null,
+		next: null,
+		keyboardNav: true,
+		keyboardRepeatDelay: 500// If arrow key pressed, delay between slide change
+	};
+
+	win[ns] = InfinitySlider;
+	return InfinitySlider;
+});
